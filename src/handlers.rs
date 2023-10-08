@@ -1,10 +1,11 @@
-use actix_web::{web, HttpResponse, Responder};
+use actix_web::{web, HttpResponse, Responder, Result};
 use sqlx::postgres::PgRow;
 use sqlx::{Row, PgPool};
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
+use bigdecimal::BigDecimal;
 use std::collections::HashMap;
-use crate::models::{Product, CartItem, Order, OrderTracking, Checkout, DiscountCoupon};
+use crate::models::{Product, CartItem, Order, OrderTracking, DiscountCoupon};
 
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(
@@ -14,7 +15,8 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             .service(web::resource("/orders").route(web::get().to(get_orders)))
             .service(web::resource("/order/{order_id}").route(web::get().to(track_order)))
             .service(web::resource("/checkout").route(web::post().to(process_checkout)))
-            .service(web::resource("/coupons").route(web::get().to(get_coupons))),
+            .service(web::resource("/coupons").route(web::get().to(get_coupons)))
+            .service(web::resource("/discount").route(web::get().to(apply_discount))),
     );
 }
 
@@ -151,13 +153,7 @@ async fn track_order(web::Path(order_id): web::Path<i32>, pool: web::Data<PgPool
         Ok(rows) => {
             let tracking_info: Vec<OrderTracking> = rows
                 .into_iter()
-                .map(|row| OrderTracking {
-                    id: row.id,
-                    order_id: row.order_id,
-                    status: row.status,
-                    location: row.location,
-                    timestamp: row.timestamp,
-                })
+                .map(|row| OrderTracking::from_row(row))
                 .collect();
 
             // Process and format the order tracking information as needed.
@@ -165,7 +161,7 @@ async fn track_order(web::Path(order_id): web::Path<i32>, pool: web::Data<PgPool
                 .iter()
                 .map(|info| format!(
                     "Tracking ID: {}, Status: {}, Location: {}, Timestamp: {}",
-                    info.id, info.status, info.location, info.timestamp
+                    info.id, info.status, info.location.as_ref().unwrap_or(&"".to_string()), info.timestamp // Access fields using methods
                 ))
                 .collect();
 
@@ -175,14 +171,17 @@ async fn track_order(web::Path(order_id): web::Path<i32>, pool: web::Data<PgPool
     }
 }
 
+
+// Define process_checkout function
 async fn process_checkout(
     pool: web::Data<PgPool>,
     user_id: web::Path<i32>,
     coupon_code: web::Path<String>,
-) -> Result<HttpResponse, HttpResponse> {
+) -> Result<HttpResponse> {
     // 1. Fetch the cart items for the user from the database.
     let user_id = user_id.into_inner(); // Extract the i32 value from the web::Path.
     let cart_items = fetch_cart_items_from_db(pool.get_ref(), user_id).await?;
+
     // 2. Calculate the total price of items in the cart.
     let total_price = calculate_total_price(&cart_items);
 
@@ -201,6 +200,17 @@ async fn process_checkout(
     // 7. Return a response indicating a successful checkout.
     Ok(HttpResponse::Ok().body(format!("Checkout completed. Order ID: {}", order_id)))
 }
+
+// Define your Actix route to use the process_checkout function
+#[actix_web::post("/checkout")]
+async fn checkout_route(
+    pool: web::Data<PgPool>,
+    user_id: web::Path<i32>,
+    coupon_code: web::Path<String>,
+) -> Result<HttpResponse> {
+    process_checkout(pool, user_id, coupon_code).await
+}
+
 
 async fn fetch_cart_items_from_db(pool: &PgPool, user_id: i32) -> Result<Vec<CartItem>, HttpResponse> {
     // Define the SQL query to retrieve cart items for the given user_id.
@@ -223,7 +233,6 @@ async fn fetch_cart_items_from_db(pool: &PgPool, user_id: i32) -> Result<Vec<Car
         }
     }
 }
-
 
 
 async fn clear_cart_items_in_db(pool: &PgPool, user_id: i32) -> Result<(), HttpResponse> {
@@ -257,21 +266,30 @@ fn calculate_total_price(cart_items: &[CartItem]) -> Decimal {
     total_price
 }
 
-fn apply_discount(coupon_code: &str) -> Decimal {
-    // let's assume we have a hard-coded list of valid coupons.
-
+fn apply_discount(coupon_code: &str) -> BigDecimal {
+    // Let's assume we have a list of valid coupons, including their discount amounts.
     let valid_coupons = [
-        ("DISCOUNT_CODE_1", Decimal::from_f64(10.0).unwrap()), // $10 discount
-        ("DISCOUNT_CODE_2", Decimal::from_f64(5.0).unwrap()),  // $5 discount
+        DiscountCoupon {
+            id: 1,
+            code: "DISCOUNT_CODE_1".to_string(),
+            discount_amount: BigDecimal::from_f64(10.0).unwrap(), // $10 discount
+            expiration_date: chrono::NaiveDate::from_ymd(2023, 12, 31),
+        },
+        DiscountCoupon {
+            id: 2,
+            code: "DISCOUNT_CODE_2".to_string(),
+            discount_amount: BigDecimal::from_f64(5.0).unwrap(),  // $5 discount
+            expiration_date: chrono::NaiveDate::from_ymd(2023, 12, 31),
+        },
     ];
 
     // Check if the provided coupon code exists in the list of valid coupons.
-    if let Some(&(_, discount_amount)) = valid_coupons.iter().find(|&&(code, _)| code == coupon_code) {
-        return discount_amount;
+    if let Some(discount_coupon) = valid_coupons.iter().find(|coupon| coupon.code == coupon_code) {
+        return discount_coupon.discount_amount.clone();
     }
 
     // If the coupon code is not found or is invalid, return zero as no discount.
-    Decimal::zero()
+    BigDecimal::zero()
 }
 
 async fn create_order_in_db(pool: &PgPool, user_id: i32, final_price: f64) -> Result<i32, HttpResponse> {
@@ -319,11 +337,10 @@ async fn get_coupons(pool: web::Data<PgPool>) -> impl Responder {
             // Return a response with the list of available coupons as a JSON array.
             HttpResponse::Ok().json(coupons)
         }
-        Err(_) => {
-            // Handle the error if fetching coupons fails.
+        Err(err) => {
+            // Handle the error if fetching coupons fails and log the error.
+            eprintln!("Error fetching coupons: {:?}", err);
             HttpResponse::InternalServerError().body("Failed to fetch discount coupons")
         }
     }
 }
-
-
