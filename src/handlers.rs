@@ -136,11 +136,11 @@ async fn get_orders(pool: web::Data<PgPool>) -> impl Responder {
     }
 }
 
-async fn track_order(web::Path(order_id): web::Path<i32>, pool: web::Data<PgPool>) -> impl Responder {
+async fn track_order(web::Path((order_id,)): web::Path<(i32,)>, pool: web::Data<PgPool>) -> impl Responder {
     // Fetch order tracking information from the database using SQLx.
     let result = sqlx::query!(
         r#"
-        SELECT id, order_id, status, location, timestamp
+        SELECT id, order_id, status, location, timestamp::timestamp
         FROM order_tracking
         WHERE order_id = $1
         "#,
@@ -161,7 +161,10 @@ async fn track_order(web::Path(order_id): web::Path<i32>, pool: web::Data<PgPool
                 .iter()
                 .map(|info| format!(
                     "Tracking ID: {}, Status: {}, Location: {}, Timestamp: {}",
-                    info.id, info.status, info.location.as_ref().unwrap_or(&"".to_string()), info.timestamp // Access fields using methods
+                    info.id,
+                    info.status,
+                    info.location.as_ref().unwrap_or(&"".to_string()),
+                    info.timestamp,
                 ))
                 .collect();
 
@@ -170,7 +173,6 @@ async fn track_order(web::Path(order_id): web::Path<i32>, pool: web::Data<PgPool
         Err(_) => HttpResponse::InternalServerError().body("Failed to fetch order tracking information"),
     }
 }
-
 
 // Define process_checkout function
 async fn process_checkout(
@@ -217,7 +219,7 @@ async fn fetch_cart_items_from_db(pool: &PgPool, user_id: i32) -> Result<Vec<Car
     let query = sqlx::query_as!(
         CartItem,
         r#"
-        SELECT id, user_id, product_id, quantity, price
+        SELECT id, user_id, product_id, quantity, price::float4
         FROM cart_items
         WHERE user_id = $1
         "#,
@@ -301,7 +303,7 @@ async fn create_order_in_db(pool: &PgPool, user_id: i32, final_price: f64) -> Re
         RETURNING id
         "#,
         user_id,
-        final_price,
+        final_price as f32, // Cast final_price to f32 for float(4) compatibility.
         "Pending"  // Set the initial status as "Pending" or adjust as needed.
     );
 
@@ -324,7 +326,7 @@ async fn get_coupons(pool: web::Data<PgPool>) -> impl Responder {
     let query = sqlx::query_as!(
         DiscountCoupon,
         r#"
-        SELECT id, code, discount_amount, expiration_date
+        SELECT id, code, discount_amount::float(4), expiration_date
         FROM discount_coupons
         WHERE expiration_date >= CURRENT_DATE
         ORDER BY expiration_date
